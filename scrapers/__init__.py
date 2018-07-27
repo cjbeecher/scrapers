@@ -6,7 +6,8 @@ if os.name == 'nt':
 else:
     split = '/'
 
+
 def make_default_path(filename):
     default_output = os.path.dirname(os.path.realpath(__file__)).split(split)
     default_output = default_output[:len(default_output)-1] + ['results', filename]
-    return default_output
+    return split.join(default_output)
