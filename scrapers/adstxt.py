@@ -1,6 +1,7 @@
 import re
 import json
 import queue
+import redis
 import requests
 import multiprocessing
 from datetime import datetime
@@ -9,6 +10,18 @@ from datetime import datetime
 URL = 'http://{0}/ads.txt'
 COMMENTS = re.compile('#.*?$', re.M)
 SUBDOMAINS = re.compile('subdomain *=(.*?)$')
+COMPLETE_KEY = 'adstxt_complete'
+HTML = re.compile('<.*?html|<.*?\?.*?xml|<.*?script|<.*?meta|<.*?head', re.I)
+
+
+def verify_is_adstxt(adstxt):
+    if adstxt is None:
+        return None
+    m = HTML.search(adstxt)
+    if m is None:
+        return adstxt
+    else:
+        return None
 
 
 def get_adstxt_file(domain):
@@ -17,14 +30,14 @@ def get_adstxt_file(domain):
         adstxt = requests.get(
             URL.format(domain),
             allow_redirects=True,
-            timeout=30
+            timeout=10
         ).text
     except Exception as exc:
         err = type(exc).__name__
         adstxt = None
     finally:
         output = {
-            'adstxt': adstxt,
+            'adstxt': verify_is_adstxt(adstxt),
             'error': err
         }
     return output
@@ -56,10 +69,11 @@ def parse_adstxt(data):
 
 
 def write_to_file(output_file, output_queue, keep_raw=False):
+    time = 15
     with open(output_file, 'w') as f:
         while True:
             try:
-                data = output_queue.get(True, 10)
+                data = output_queue.get(True, time)
             except queue.Empty:
                 break
             if not keep_raw:
@@ -67,6 +81,7 @@ def write_to_file(output_file, output_queue, keep_raw=False):
             data = json.dumps(data)
             f.write(data+'\n')
             output_queue.task_done()
+    return
 
 
 def scan_domains(input_queue, output_queue):
@@ -76,15 +91,22 @@ def scan_domains(input_queue, output_queue):
     :param output_queue: Results queue for writing to file
     :return:
     """
+    processed = redis.Redis()
     while True:
         try:
             domain = input_queue.get(True, 3)
+            if processed.sismember(COMPLETE_KEY, domain):
+                input_queue.task_done()
+                continue
         except queue.Empty:
             break
         data = get_adstxt_file(domain)
         data['domain'] = domain
         parse_adstxt(data)
+        processed.sadd(COMPLETE_KEY, domain)
         input_queue.task_done()
+        for subdomain in data['parsed']['subdomains']:
+            input_queue.put(subdomain)
         output_queue.put(data)
 
 
@@ -106,6 +128,8 @@ def run(output, domains=None, input_file=None, keep_raw=False, process_count=2):
     if domains is None:
         with open(input_file, 'r') as f:
             domains = [i.strip() for i in f.read().split('\n')]
+    processed = redis.Redis()
+    processed.delete(COMPLETE_KEY)
     processes = []
     for i in range(process_count):
         process = multiprocessing.Process(target=scan_domains, args=(input_queue, output_queue,))
@@ -117,6 +141,8 @@ def run(output, domains=None, input_file=None, keep_raw=False, process_count=2):
         input_queue.put(domain)
     input_queue.join()
     output_queue.join()
+    writer.join()
+    processed.delete(COMPLETE_KEY)
 
 
 if __name__ == '__main__':
