@@ -4,6 +4,7 @@ import queue
 import redis
 import requests
 import multiprocessing
+from io import StringIO
 from datetime import datetime
 
 
@@ -70,17 +71,30 @@ def parse_adstxt(data):
 
 def write_to_file(output_file, output_queue, keep_raw=False):
     time = 15
-    with open(output_file, 'w') as f:
-        while True:
-            try:
-                data = output_queue.get(True, time)
-            except queue.Empty:
-                break
-            if not keep_raw:
-                del data['adstxt']
-            data = json.dumps(data)
-            f.write(data+'\n')
-            output_queue.task_done()
+    batch = 10000
+    tmp = StringIO()
+    current = 0
+    while True:
+        try:
+            data = output_queue.get(True, time)
+        except queue.Empty:
+            break
+        if not keep_raw:
+            del data['adstxt']
+        data = json.dumps(data)
+        tmp.write(data + '\n')
+        output_queue.task_done()
+        current += 1
+        if current == batch:
+            tmp.seek(0)
+            with open(output_file, 'a') as f:
+                f.write(tmp.read())
+            tmp = StringIO()
+            current = 0
+    if current > 0:
+        tmp.seek(0)
+        with open(output_file, 'a') as f:
+            f.write(tmp.read())
     return
 
 
@@ -94,7 +108,7 @@ def scan_domains(input_queue, output_queue):
     processed = redis.Redis()
     while True:
         try:
-            domain = input_queue.get(True, 3)
+            domain = input_queue.get(True, 3).strip()
             if processed.sismember(COMPLETE_KEY, domain):
                 input_queue.task_done()
                 continue
@@ -106,7 +120,8 @@ def scan_domains(input_queue, output_queue):
         processed.sadd(COMPLETE_KEY, domain)
         input_queue.task_done()
         for subdomain in data['parsed']['subdomains']:
-            input_queue.put(subdomain)
+            if not processed.sismember(COMPLETE_KEY, subdomain):
+                input_queue.put(subdomain)
         output_queue.put(data)
 
 
@@ -116,6 +131,7 @@ def run(output, domains=None, input_file=None, keep_raw=False, process_count=2):
     :param output: Where to store the results
     :param domains: List of domains to process
     :param input_file: New line delimited file with domains to process
+    :param keep_raw: Keep raw results after processing
     :param process_count: Number of processes to spawn
     :return:
     """
